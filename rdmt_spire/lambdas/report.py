@@ -1,7 +1,7 @@
+import datetime
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime
 
 import boto3
 import duckdb
@@ -78,15 +78,24 @@ def _get_report_spec(report_type: str = FileTypes.L2_SCIENCE, params: dict = {})
         f"Invalid report_type '{report_type}'. Must be '{FileTypes.L2_SCIENCE}' or '{FileTypes.L1_GUIDE_WINDOW}'."
     )
 
-def report_function(report_type: str = FileTypes.L2_SCIENCE):
+def report_function(report_type: str = FileTypes.L2_SCIENCE,
+                    exp_range_start: str | datetime.datetime = None,
+                    exp_range_end: str | datetime.datetime = None):
     """
     Orchestrates the extraction, transformation, and reporting of RDMT file
     metadata, metrics and evaluations.
 
     This function connects to a MySQL database via DuckDB, identifies new
-    records ready for reporting based on monitor status, updates their report
+    records ready for reporting based on either monitor status or a
+    user-provided range of exposure start times, updates their report
     timestamps, exports the combined metadata and results to a partitioned S3
     Parquet dataset, and finally sends a summary notification via AWS SNS.
+
+    If exp_range_start and exp_range_end arguments are absent (default),
+    reports are generated for all database rows whose `monitor_end_datetime`
+    entries are null. If exp_range_start and exp_range_end arguments are
+    supplied, reports are generated for all rows with `exp_start_time` values
+    within the chosen date range.
 
     The process follows an ELT (Extract, Load, Transform) pattern leveraging
     DuckDB's in-memory processing and S3 connectivity.
@@ -94,7 +103,14 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE):
     Parameters
     ----------
     report_type : str
-        The type of report to generate either FileTypes.L2_SCIENCE or FileTypes.L1_GUIDE_WINDOW. Defaults to FileTypes.L2_SCIENCE.
+        The type of report to generate either FileTypes.L2_SCIENCE or
+        FileTypes.L1_GUIDE_WINDOW. Defaults to FileTypes.L2_SCIENCE.
+    exp_range_start : str, datetime.datetime, or None
+        The earliest (inclusive) UTC `exp_start_time` value in database rows
+        from which reports will be generated. [Default: None]
+    exp_range_end : str, datetime.datetime, or None
+        The latest (inclusive) UTC `exp_start_time` value in database rows
+        from which reports will be generated. [Default: None]
 
     Returns
     -------
@@ -102,6 +118,23 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE):
         A dictionary containing the execution status and a summary message.
         Example: ``{'statusCode': 200, 'body': [{'_message': '...'}]}``.
     """
+    if not any((exp_range_start, exp_range_end)):
+        select_by_null = True
+    elif not all((exp_range_start, exp_range_end)):
+        raise ValueError('Must supply either both or none of exp_range_start '
+                         'and exp_range_end arguments to report function.')
+    elif (not isinstance(exp_range_start, (str, datetime.datetime))
+          or not isinstance(exp_range_end, (str, datetime.datetime))
+    ):
+        raise ValueError ('exp_range_start and exp_range_end arguments of '
+                          'report function must be str or datetime.datetime.')
+    else:
+        select_by_null = False  # report by user-provided exp start times
+        if isinstance(exp_range_start, str):
+            exp_range_start = datetime.datetime.fromisoformat(exp_range_start)
+        if isinstance(exp_range_end, str):
+            exp_range_end = datetime.datetime.fromisoformat(exp_range_end)
+
     expected_parameters = AWS_DBS + [PARQUET_FILE_BUCKET]
     if report_type == FileTypes.L2_SCIENCE:
         expected_parameters.append(SCIENCE_REPORTING_TOPIC)
@@ -153,17 +186,28 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE):
         # Switch to using rdmt_db server as default to allow SQLAlchemy to make SQL strings
         conn.sql("USE rdmt_db;")
 
-        # Generate the report datetime and set the value for all columns to be reported (e.g. all rows where file reported date is not populated but all "_status" columns are -1 or 1 (indicating all monitors that needed to run have done so successfully))
-        report_time = datetime.now().replace(microsecond=0)
+        # Generate the report datetime and set the value for all columns to be
+        # reported. Depending on function arguments, all rows where either:
+        # a) file reported date is not populated but all "_status" columns are
+        # -1 or 1 (indicating all monitors that needed to run have done so successfully)
+        # b) exposure start time is between exp_range_start and exp_range_end
+        report_time = datetime.datetime.now().replace(microsecond=0)
         status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
+        time_condition = ('IS NULL' if select_by_null
+                          else f"BETWEEN {exp_range_start} AND {exp_range_end}")
         update_report_time_str = f"""
             UPDATE {report_spec.meta_table_name}
             SET monitor_end_datetime = $1
             WHERE {status_ready_condition}
-            AND monitor_end_datetime IS NULL
+            AND monitor_end_datetime {time_condition}
         """
         update_report_result = conn.execute(update_report_time_str, (report_time,))
         num_reported_rows = update_report_result.fetchall()[0][0]
+        if select_by_null:
+            logger.info('Selecting report rows by null monitor_end_datetime')
+        else:
+            logger.info('Selecting report rows from exp_start_time '
+                        f"{exp_range_start} to {exp_range_end}")
         logger.info(f"Number of reported rows: {num_reported_rows}")
 
         if num_reported_rows > 0:
@@ -310,7 +354,7 @@ def generate_report_message(
     s3_parquet_bucket : str
         The base S3 bucket path (e.g., 's3://my-data-bucket/'). The function
         appends wildcards to search for nested Parquet files.
-    report_generation_time : str or datetime
+    report_generation_time : str or datetime.datetime
         The specific timestamp used to filter the `monitor_end_datetime`
         column in the dataset.
     report_spec : ReportSpec
@@ -379,7 +423,7 @@ def get_failed_evaluations(
     s3_parquet_file_path : str
         The S3 URI or path to the Parquet files (e.g., 's3://bucket/data/').
         Must support Hive-style partitioning.
-    report_generation_time : str or datetime
+    report_generation_time : str or datetime.datetime
         The specific timestamp used to filter the `monitor_end_datetime`
         column in the dataset.
     report_spec : ReportSpec
@@ -466,7 +510,7 @@ def get_monitored_files(
     s3_parquet_file_path : str
         The S3 URI or path to the Parquet files (e.g., 's3://bucket/data/').
         Must support Hive-style partitioning.
-    report_generation_time : str or datetime
+    report_generation_time : str or datetime.datetime
         The specific timestamp used to filter the `monitor_end_datetime`
         column in the dataset.
     report_spec : ReportSpec
