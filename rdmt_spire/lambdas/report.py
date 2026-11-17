@@ -194,15 +194,16 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         report_time = datetime.datetime.now().replace(microsecond=0)
         status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
         time_condition = ('monitor_end_datetime IS NULL' if select_by_null
-                          else (f"exp_start_time >= {exp_range_start} AND "
-                                f"exp_start_time <= {exp_range_end}"))
+                          else 'exp_start_time >= $2 AND exp_start_time <= $3')
         update_report_time_str = f"""
             UPDATE {report_spec.meta_table_name}
             SET monitor_end_datetime = $1
             WHERE {status_ready_condition}
             AND {time_condition}
         """
-        update_report_result = conn.execute(update_report_time_str, (report_time,))
+        pos_params = ((report_time,) + (() if select_by_null
+                                        else (exp_range_start, exp_range_end)))
+        update_report_result = conn.execute(update_report_time_str, pos_params)
         num_reported_rows = update_report_result.fetchall()[0][0]
         if select_by_null:
             logger.info('Selecting report rows by null monitor_end_datetime')
