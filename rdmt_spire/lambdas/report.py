@@ -193,13 +193,14 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         # b) exposure start time is between exp_range_start and exp_range_end
         report_time = datetime.datetime.now().replace(microsecond=0)
         status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
-        time_condition = ('IS NULL' if select_by_null
-                          else f"BETWEEN {exp_range_start} AND {exp_range_end}")
+        time_condition = ('monitor_end_datetime IS NULL' if select_by_null
+                          else (f"exp_start_time >= {exp_range_start} AND "
+                                f"exp_start_time <= {exp_range_end}"))
         update_report_time_str = f"""
             UPDATE {report_spec.meta_table_name}
             SET monitor_end_datetime = $1
             WHERE {status_ready_condition}
-            AND monitor_end_datetime {time_condition}
+            AND {time_condition}
         """
         update_report_result = conn.execute(update_report_time_str, (report_time,))
         num_reported_rows = update_report_result.fetchall()[0][0]
@@ -354,7 +355,7 @@ def generate_report_message(
     s3_parquet_bucket : str
         The base S3 bucket path (e.g., 's3://my-data-bucket/'). The function
         appends wildcards to search for nested Parquet files.
-    report_generation_time : str or datetime.datetime
+    report_generation_time : datetime.datetime
         The specific timestamp used to filter the `monitor_end_datetime`
         column in the dataset.
     report_spec : ReportSpec
