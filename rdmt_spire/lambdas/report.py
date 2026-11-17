@@ -94,8 +94,8 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
     If exp_range_start and exp_range_end arguments are absent (default),
     reports are generated for all database rows whose `monitor_end_datetime`
     entries are null. If exp_range_start and exp_range_end arguments are
-    supplied, reports are generated for all rows with `exp_start_time` values
-    within the chosen date range.
+    supplied, reports are generated for all rows with `exp_start_datetime`
+    values within the chosen date range.
 
     The process follows an ELT (Extract, Load, Transform) pattern leveraging
     DuckDB's in-memory processing and S3 connectivity.
@@ -106,10 +106,10 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         The type of report to generate either FileTypes.L2_SCIENCE or
         FileTypes.L1_GUIDE_WINDOW. Defaults to FileTypes.L2_SCIENCE.
     exp_range_start : str, datetime.datetime, or None
-        The earliest (inclusive) UTC `exp_start_time` value in database rows
+        The earliest (inclusive) UTC `exp_start_datetime` value in database rows
         from which reports will be generated. [Default: None]
     exp_range_end : str, datetime.datetime, or None
-        The latest (inclusive) UTC `exp_start_time` value in database rows
+        The latest (inclusive) UTC `exp_start_datetime` value in database rows
         from which reports will be generated. [Default: None]
 
     Returns
@@ -194,7 +194,8 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         report_time = datetime.datetime.now().replace(microsecond=0)
         status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
         time_condition = ('monitor_end_datetime IS NULL' if select_by_null
-                          else 'exp_start_time >= $2 AND exp_start_time <= $3')
+                          else ('exp_start_datetime >= $2 '
+                                'AND exp_start_datetime <= $3'))
         update_report_time_str = f"""
             UPDATE {report_spec.meta_table_name}
             SET monitor_end_datetime = $1
@@ -208,7 +209,7 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         if select_by_null:
             logger.info('Selecting report rows by null monitor_end_datetime')
         else:
-            logger.info('Selecting report rows from exp_start_time '
+            logger.info('Selecting report rows from exp_start_datetime '
                         f"{exp_range_start} to {exp_range_end}")
         logger.info(f"Number of reported rows: {num_reported_rows}")
 
