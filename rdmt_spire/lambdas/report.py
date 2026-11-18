@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import boto3
 import duckdb
+from sqlalchemy import text
 
 from ..constants.codes import StatusCodes
 from ..constants.database import MonitorStatus
@@ -134,8 +135,8 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
             exp_range_start = datetime.datetime.fromisoformat(exp_range_start)
         if isinstance(exp_range_end, str):
             exp_range_end = datetime.datetime.fromisoformat(exp_range_end)
-        exp_range_start = exp_range_start.strftime('%Y-%m-%d %H:%M:%S')
-        exp_range_end = exp_range_end.strftime('%Y-%m-%d %H:%M:%S')
+        # exp_range_start = exp_range_start.strftime('%Y-%m-%d %H:%M:%S')
+        # exp_range_end = exp_range_end.strftime('%Y-%m-%d %H:%M:%S')
 
     expected_parameters = AWS_DBS + [PARQUET_FILE_BUCKET]
     if report_type == FileTypes.L2_SCIENCE:
@@ -188,6 +189,10 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         # Switch to using rdmt_db server as default to allow SQLAlchemy to make SQL strings
         conn.sql("USE rdmt_db;")
 
+        # OJO: get direct mysql DB connection (without duckdb layer)
+        logger.info('Getting SQLAlchemy database engine')
+        engine = connect_to_db(database_name=params[DB_NAME], secret_name=params[DB_SECRET_NAME])
+
         # Generate the report datetime and set the value for all columns to be
         # reported. Depending on function arguments, all rows where either:
         # a) file reported date is not populated but all "_status" columns are
@@ -195,26 +200,67 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         # b) exposure start time is between exp_range_start and exp_range_end
         report_time = datetime.datetime.now().replace(microsecond=0)
         status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
-        time_condition = ('monitor_end_datetime IS NULL' if select_by_null
-                          else (f"exp_start_datetime >= '{exp_range_start}' "
-                                f"AND exp_start_datetime <= '{exp_range_end}'"))
-        update_report_time_str = f"""
-            UPDATE {report_spec.meta_table_name}
-            SET monitor_end_datetime = $1
-            WHERE {status_ready_condition}
-            AND {time_condition}
-        """
-        # pos_params = ((report_time,) + (() if select_by_null
-        #                                 else (exp_range_start, exp_range_end)))
-        # update_report_result = conn.execute(update_report_time_str, pos_params)
-        update_report_result = conn.execute(update_report_time_str, (report_time,))
-        num_reported_rows = update_report_result.fetchall()[0][0]
+        with engine.connect() as eng:
+            # time_condition = ('monitor_end_datetime IS NULL' if select_by_null
+            #                   else (f"exp_start_datetime >= {exp_range_start} "
+            #                         f"AND exp_start_datetime <= {exp_range_end}"))
+            # update_report_time_str = f"""
+            #     UPDATE {report_spec.meta_table_name}
+            #     SET monitor_end_datetime = $1
+            #     WHERE {status_ready_condition}
+            #     AND {time_condition}
+            # """
+            time_condition = ('monitor_end_datetime IS NULL' if select_by_null
+                              else (f"exp_start_datetime >= :begin "
+                                    f"AND exp_start_datetime <= :end"))
+            update_report_time_str = f"""
+                UPDATE {report_spec.meta_table_name}
+                SET monitor_end_datetime = :now
+                WHERE {status_ready_condition}
+                AND {time_condition}
+            """
+            # pos_params = ((report_time,) + (() if select_by_null
+            #                                 else (exp_range_start, exp_range_end)))
+            query_dict = {'now': report_time,
+                          'begin': exp_range_start, 'end': exp_range_end}
+            # update_report_result = conn.execute(update_report_time_str, pos_params)
+            # update_report_result = conn.execute(update_report_time_str, (report_time,))
+            logger.info(f"Query: {text(update_report_time_str).text}")
+            update_report_result = eng.execute(text(update_report_time_str),
+                                              query_dict)
+            # num_reported_rows = update_report_result.fetchall()[0][0]
+            num_reported_rows = update_report_result.rowcount
+            logger.info(f"Reported rows: {num_reported_rows}")
+            eng.commit()
         if select_by_null:
             logger.info('Selecting report rows by null monitor_end_datetime')
         else:
             logger.info('Selecting report rows from exp_start_datetime '
                         f"{exp_range_start} to {exp_range_end}")
         logger.info(f"Number of reported rows: {num_reported_rows}")
+
+        # report_time = datetime.datetime.now().replace(microsecond=0)
+        # status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
+        # time_condition = ('monitor_end_datetime IS NULL' if select_by_null
+        #                   else (f"exp_start_datetime >= {exp_range_start} "
+        #                         f"AND exp_start_datetime <= {exp_range_end}"))
+        # update_report_time_str = f"""
+        #     UPDATE {report_spec.meta_table_name}
+        #     SET monitor_end_datetime = $1
+        #     WHERE {status_ready_condition}
+        #     AND {time_condition}
+        # """
+        # # pos_params = ((report_time,) + (() if select_by_null
+        # #                                 else (exp_range_start, exp_range_end)))
+        # # update_report_result = conn.execute(update_report_time_str, pos_params)
+        # update_report_result = conn.execute(update_report_time_str, (report_time,))
+        # num_reported_rows = update_report_result.fetchall()[0][0]
+        # if select_by_null:
+        #     logger.info('Selecting report rows by null monitor_end_datetime')
+        # else:
+        #     logger.info('Selecting report rows from exp_start_datetime '
+        #                 f"{exp_range_start} to {exp_range_end}")
+        # logger.info(f"Number of reported rows: {num_reported_rows}")
 
         if num_reported_rows > 0:
             # Package metadata and results data into Parquet dataset
@@ -306,6 +352,9 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
                 logger.warning(f"DuckDB cleanup warning: {cleanup_error}")
             finally:
                 conn.close()
+
+        # OJO: close direct sqlalchemy connection
+        engine.connect().close()
 
     logger.info("Successfully finished reporting lambda.")
     return {'statusCode': StatusCodes.SUCCESS,
