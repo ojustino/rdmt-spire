@@ -134,6 +134,8 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
             exp_range_start = datetime.datetime.fromisoformat(exp_range_start)
         if isinstance(exp_range_end, str):
             exp_range_end = datetime.datetime.fromisoformat(exp_range_end)
+        exp_range_start = exp_range_start.strftime('%Y-%m-%d %H:%M:%S')
+        exp_range_end = exp_range_end.strftime('%Y-%m-%d %H:%M:%S')
 
     expected_parameters = AWS_DBS + [PARQUET_FILE_BUCKET]
     if report_type == FileTypes.L2_SCIENCE:
@@ -194,17 +196,18 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         report_time = datetime.datetime.now().replace(microsecond=0)
         status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
         time_condition = ('monitor_end_datetime IS NULL' if select_by_null
-                          else ('exp_start_datetime >= $2 '
-                                'AND exp_start_datetime <= $3'))
+                          else (f"exp_start_datetime >= '{exp_range_start}' "
+                                f"AND exp_start_datetime <= '{exp_range_end}'"))
         update_report_time_str = f"""
             UPDATE {report_spec.meta_table_name}
             SET monitor_end_datetime = $1
             WHERE {status_ready_condition}
             AND {time_condition}
         """
-        pos_params = ((report_time,) + (() if select_by_null
-                                        else (exp_range_start, exp_range_end)))
-        update_report_result = conn.execute(update_report_time_str, pos_params)
+        # pos_params = ((report_time,) + (() if select_by_null
+        #                                 else (exp_range_start, exp_range_end)))
+        # update_report_result = conn.execute(update_report_time_str, pos_params)
+        update_report_result = conn.execute(update_report_time_str, (report_time,))
         num_reported_rows = update_report_result.fetchall()[0][0]
         if select_by_null:
             logger.info('Selecting report rows by null monitor_end_datetime')
