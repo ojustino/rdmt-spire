@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import boto3
 import duckdb
+import sqlalchemy.engine
 from sqlalchemy import text
 
 from ..constants.codes import StatusCodes
@@ -162,11 +163,11 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         # -1 or 1 (indicating all monitors that needed to run have done so successfully)
         # b) exposure start time is between exp_range_start and exp_range_end
         report_time = datetime.datetime.now().replace(microsecond=0)
-        # status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
+        status_ready_condition = _status_columns_ready_condition(eng, report_spec.meta_table_name)
         # TEMPORARILY DEFINE status_ready_condition MANUALLY TO AVOID DUCKDB
-        status_ready_condition = ("astrometry_status IN (-1, 1) "
-                                  "AND essential_status IN (-1, 1) "
-                                  "AND source_catalog_status IN (-1, 1)")
+        # status_ready_condition = ("astrometry_status IN (-1, 1) "
+        #                           "AND essential_status IN (-1, 1) "
+        #                           "AND source_catalog_status IN (-1, 1)")
         with engine.connect() as eng:
             # time_condition = ('monitor_end_datetime IS NULL' if select_by_null
             #                   else (f"exp_start_datetime >= {exp_range_start} "
@@ -407,19 +408,40 @@ def _status_columns_ready_condition(conn, table_name: str) -> str:
 
     Parameters
     ----------
-    conn : duckdb.DuckDBPyConnection
-        An active DuckDB connection object capable of executing SQL queries.
+    conn : duckdb.DuckDBPyConnection or sqlalchemy.engine.Connection
+        An active DuckDB or SQLAlchemy connection object capable of executing
+        SQL queries.
     table_name : str
         The name of the table to inspect for *_status columns.
     """
-    status_columns_query = """
+    if isinstance(conn, duckdb.DuckDBPyConnection):
+        key_formatter = '$'
+    elif isinstance(conn, sqlalchemy.engine.Connection):
+        key_formatter = ':'
+    else:
+        raise ValueError('Connection type for _status_columns_ready_condition '
+                         'must be duckdb.DuckDBPyConnection or '
+                         'sqlalchemy.engine.Connection.')
+
+    status_columns_query = f"""
         SELECT column_name
         FROM information_schema.columns
-        WHERE table_name = $1
+        WHERE table_name = {key_formatter}table
           AND column_name LIKE '%_status'
         ORDER BY column_name;
     """
-    status_columns = [row[0] for row in conn.execute(status_columns_query, (table_name,)).fetchall()]
+    query_dict = {'table': table_name}
+    status_columns = [row[0] for row in conn.execute(status_columns_query,
+                                                     query_dict).fetchall()]
+
+    # status_columns_query = """
+    #     SELECT column_name
+    #     FROM information_schema.columns
+    #     WHERE table_name = $1
+    #       AND column_name LIKE '%_status'
+    #     ORDER BY column_name;
+    # """
+    # status_columns = [row[0] for row in conn.execute(status_columns_query, (table_name,)).fetchall()]
 
     if not status_columns:
         raise ValueError(f"No *_status columns found in table '{table_name}'.")
