@@ -146,52 +146,15 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
     params = fetch_parameters_from_path(AWS_PARAMETER_PATH, expected_parameters=expected_parameters)
 
     conn = None
+
+    # OJO: try completing and closing sqlalchemy work before duckdb portion
     try:
         report_spec = _get_report_spec(report_type, params)
 
-        logger.info('Getting SQL URL')
-        sql_url = connect_to_db(database_name=params[DB_NAME], secret_name=params[DB_SECRET_NAME]).url
-
-        # initialize duckdb local database
-        logger.info('Connecting to duckdb')
-        conn = duckdb.connect(database=':memory:')
-        duckdb_extension_path = os.environ.get('DUCKDB_EXTENSIONS_PATH', '/duckdb_extensions')
-        conn.execute(f"SET extension_directory = '{duckdb_extension_path}';")
-
-        # Load the extensions pre-baked into your Docker image
-        # 'mysql': To connect to MySQL; 'aws' & 'httpfs': To stream directly to S3
-        logger.info('Loading duckdb modules')
-        conn.execute("LOAD mysql;")# TODO: LOAD aws; LOAD httpfs;")
-
-        # 2. Create a secret using the 'credential_chain' provider
-        # This tells DuckDB to automatically find credentials using AWS SDK mechanisms
-        logger.info('Creating duckdb secrets')
-        conn.execute("CREATE SECRET (TYPE s3, PROVIDER credential_chain);")
-
-        # --- 3. LINKING THE DATABASE ---
-        # Construct a DuckDB-specific connection string from the SQLAlchemy object
-        create_secret_sql = f"""
-            CREATE OR REPLACE TEMPORARY SECRET db_secret (
-                TYPE mysql,
-                HOST '{sql_url.host}',
-                DATABASE '{sql_url.database}',
-                USER '{sql_url.username}',
-                PASSWORD '{sql_url.password}'
-            );
-            """
-        conn.sql(create_secret_sql)
-
-        # 'ATTACH' creates a virtual link. It does NOT download the data yet.
-        # To DuckDB, the remote MySQL database now behaves like a local schema.
-        logger.info('Attaching external database to duckdb')
-        conn.sql("ATTACH '' AS rdmt_db (TYPE mysql, SECRET 'db_secret');")
-
-        # Switch to using rdmt_db server as default to allow SQLAlchemy to make SQL strings
-        conn.sql("USE rdmt_db;")
-
         # OJO: get direct mysql DB connection (without duckdb layer)
         logger.info('Getting SQLAlchemy database engine')
-        engine = connect_to_db(database_name=params[DB_NAME], secret_name=params[DB_SECRET_NAME])
+        engine = connect_to_db(database_name=params[DB_NAME],
+                               secret_name=params[DB_SECRET_NAME])
 
         # Generate the report datetime and set the value for all columns to be
         # reported. Depending on function arguments, all rows where either:
@@ -199,7 +162,11 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         # -1 or 1 (indicating all monitors that needed to run have done so successfully)
         # b) exposure start time is between exp_range_start and exp_range_end
         report_time = datetime.datetime.now().replace(microsecond=0)
-        status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
+        # status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
+        # TEMPORARILY DEFINE status_ready_condition MANUALLY TO AVOID DUCKDB
+        status_ready_condition = ("astrometry_status IN (-1, 1) "
+                                  "AND essential_status IN (-1, 1) "
+                                  "AND source_catalog_status IN (-1, 1)")
         with engine.connect() as eng:
             # time_condition = ('monitor_end_datetime IS NULL' if select_by_null
             #                   else (f"exp_start_datetime >= {exp_range_start} "
@@ -230,14 +197,64 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
                                               query_dict)
             # num_reported_rows = update_report_result.fetchall()[0][0]
             num_reported_rows = update_report_result.rowcount
-            logger.info(f"Reported rows: {num_reported_rows}")
             eng.commit()
+            logger.info(f"Reported rows: {num_reported_rows}")
         if select_by_null:
             logger.info('Selecting report rows by null monitor_end_datetime')
         else:
             logger.info('Selecting report rows from exp_start_datetime '
                         f"{exp_range_start} to {exp_range_end}")
         logger.info(f"Number of reported rows: {num_reported_rows}")
+    except Exception as e:
+        logger.error(f"{e}")
+        raise e
+    finally:
+        # OJO: close direct sqlalchemy connection
+        engine.connect().close()
+
+    if num_reported_rows > 0:
+        try:
+            # report_spec = _get_report_spec(report_type, params)
+
+            logger.info('Getting SQL URL')
+            sql_url = connect_to_db(database_name=params[DB_NAME], secret_name=params[DB_SECRET_NAME]).url
+
+            # initialize duckdb local database
+            logger.info('Connecting to duckdb')
+            conn = duckdb.connect(database=':memory:')
+            duckdb_extension_path = os.environ.get('DUCKDB_EXTENSIONS_PATH', '/duckdb_extensions')
+            conn.execute(f"SET extension_directory = '{duckdb_extension_path}';")
+
+            # Load the extensions pre-baked into your Docker image
+            # 'mysql': To connect to MySQL; 'aws' & 'httpfs': To stream directly to S3
+            logger.info('Loading duckdb modules')
+            conn.execute("LOAD mysql;")# TODO: LOAD aws; LOAD httpfs;")
+
+            # 2. Create a secret using the 'credential_chain' provider
+            # This tells DuckDB to automatically find credentials using AWS SDK mechanisms
+            logger.info('Creating duckdb secrets')
+            conn.execute("CREATE SECRET (TYPE s3, PROVIDER credential_chain);")
+
+            # --- 3. LINKING THE DATABASE ---
+            # Construct a DuckDB-specific connection string from the SQLAlchemy object
+            create_secret_sql = f"""
+                CREATE OR REPLACE TEMPORARY SECRET db_secret (
+                    TYPE mysql,
+                    HOST '{sql_url.host}',
+                    DATABASE '{sql_url.database}',
+                    USER '{sql_url.username}',
+                    PASSWORD '{sql_url.password}'
+                );
+                """
+            conn.sql(create_secret_sql)
+
+            # 'ATTACH' creates a virtual link. It does NOT download the data yet.
+            # To DuckDB, the remote MySQL database now behaves like a local schema.
+            logger.info('Attaching external database to duckdb')
+            conn.sql("ATTACH '' AS rdmt_db (TYPE mysql, SECRET 'db_secret');")
+
+            # Switch to using rdmt_db server as default to allow SQLAlchemy to make SQL strings
+            conn.sql("USE rdmt_db;")
 
         # report_time = datetime.datetime.now().replace(microsecond=0)
         # status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
@@ -262,7 +279,7 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         #                 f"{exp_range_start} to {exp_range_end}")
         # logger.info(f"Number of reported rows: {num_reported_rows}")
 
-        if num_reported_rows > 0:
+        # if num_reported_rows > 0:
             # Package metadata and results data into Parquet dataset
             s3_dataset_prefix = f"{report_spec.dataset_prefix}/"
             s3_parquet_bucket_path = f"s3://{params[PARQUET_FILE_BUCKET]}/{s3_dataset_prefix}"
@@ -324,37 +341,62 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
                 logger.error(f'{e}')
                 raise e
 
-        else:
-            logger.info('No new rows to report.')
+        # else:
+        #     logger.info('No new rows to report.')
 
-            return {'statusCode': StatusCodes.SUCCESS,
-                    'body': [{'message':'report_function: No new rows to report.'}]}
+        #     return {'statusCode': StatusCodes.SUCCESS,
+        #             'body': [{'message':'report_function: No new rows to report.'}]}
 
-    except Exception as e:
-        logger.error(f"{e}")
-        raise e
-    finally:
-        if conn is not None:
-            try:
-                databases = conn.sql("SHOW DATABASES").fetchall()
-                db_names = [row[0] for row in databases]
+    # except Exception as e:
+    #     logger.error(f"{e}")
+    #     raise e
+    # finally:
+    #     if conn is not None:
+    #         try:
+    #             databases = conn.sql("SHOW DATABASES").fetchall()
+    #             db_names = [row[0] for row in databases]
 
-                if "rdmt_db" in db_names:
-                    fallback_db = next((name for name in db_names if name != "rdmt_db"), None)
-                    if fallback_db is not None:
-                        conn.execute(f"USE {fallback_db};")
-                    else:
-                        # If rdmt_db is the only visible database, create one to switch into.
-                        conn.execute("ATTACH ':memory:' AS fallback_db;")
-                        conn.execute("USE fallback_db;")
-                    conn.execute("DETACH rdmt_db;")
-            except Exception as cleanup_error:
-                logger.warning(f"DuckDB cleanup warning: {cleanup_error}")
-            finally:
-                conn.close()
+    #             if "rdmt_db" in db_names:
+    #                 fallback_db = next((name for name in db_names if name != "rdmt_db"), None)
+    #                 if fallback_db is not None:
+    #                     conn.execute(f"USE {fallback_db};")
+    #                 else:
+    #                     # If rdmt_db is the only visible database, create one to switch into.
+    #                     conn.execute("ATTACH ':memory:' AS fallback_db;")
+    #                     conn.execute("USE fallback_db;")
+    #                 conn.execute("DETACH rdmt_db;")
+    #         except Exception as cleanup_error:
+    #             logger.warning(f"DuckDB cleanup warning: {cleanup_error}")
+    #         finally:
+    #             conn.close()
+        except Exception as e:
+            logger.error(f"{e}")
+            raise e
+        finally:
+            if conn is not None:
+                try:
+                    databases = conn.sql("SHOW DATABASES").fetchall()
+                    db_names = [row[0] for row in databases]
 
-        # OJO: close direct sqlalchemy connection
-        engine.connect().close()
+                    if "rdmt_db" in db_names:
+                        fallback_db = next((name for name in db_names if name != "rdmt_db"), None)
+                        if fallback_db is not None:
+                            conn.execute(f"USE {fallback_db};")
+                        else:
+                            # If rdmt_db is the only visible database, create one to switch into.
+                            conn.execute("ATTACH ':memory:' AS fallback_db;")
+                            conn.execute("USE fallback_db;")
+                        conn.execute("DETACH rdmt_db;")
+                except Exception as cleanup_error:
+                    logger.warning(f"DuckDB cleanup warning: {cleanup_error}")
+                finally:
+                    conn.close()
+
+    else:
+        logger.info('No new rows to report.')
+
+        return {'statusCode': StatusCodes.SUCCESS,
+                'body': [{'message':'report_function: No new rows to report.'}]}
 
     logger.info("Successfully finished reporting lambda.")
     return {'statusCode': StatusCodes.SUCCESS,
