@@ -122,6 +122,7 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
     """
     if not any((exp_range_start, exp_range_end)):
         select_by_null = True
+        logger.info('Selecting report rows by null monitor_end_datetime')
     elif not all((exp_range_start, exp_range_end)):
         raise ValueError('Must supply either both or none of exp_range_start '
                          'and exp_range_end arguments to report function.')
@@ -131,13 +132,13 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         raise ValueError ('exp_range_start and exp_range_end arguments of '
                           'report function must be str or datetime.datetime.')
     else:
-        select_by_null = False  # report by user-provided exp start times
+        select_by_null = False
+        logger.info('Selecting report rows from exp_start_datetime '
+                        f"{exp_range_start} to {exp_range_end}")
         if isinstance(exp_range_start, str):
             exp_range_start = datetime.datetime.fromisoformat(exp_range_start)
         if isinstance(exp_range_end, str):
             exp_range_end = datetime.datetime.fromisoformat(exp_range_end)
-        # exp_range_start = exp_range_start.strftime('%Y-%m-%d %H:%M:%S')
-        # exp_range_end = exp_range_end.strftime('%Y-%m-%d %H:%M:%S')
 
     expected_parameters = AWS_DBS + [PARQUET_FILE_BUCKET]
     if report_type == FileTypes.L2_SCIENCE:
@@ -148,11 +149,12 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
 
     conn = None
 
-    # OJO: try completing and closing sqlalchemy work before duckdb portion
+    # query matching rows with sqlalchemy for better datetime handling in WHERE
+    # clause in exp_start_datetime cases (DuckDB adds "::TIMESTAMP" to them)
     try:
         report_spec = _get_report_spec(report_type, params)
 
-        # OJO: get direct mysql DB connection (without duckdb layer)
+        # initialize sqlalchemy connection
         logger.info('Getting SQLAlchemy database engine')
         engine = connect_to_db(database_name=params[DB_NAME],
                                secret_name=params[DB_SECRET_NAME])
@@ -163,21 +165,9 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         # -1 or 1 (indicating all monitors that needed to run have done so successfully)
         # b) exposure start time is between exp_range_start and exp_range_end
         report_time = datetime.datetime.now().replace(microsecond=0)
-        status_ready_condition = _status_columns_ready_condition(eng, report_spec.meta_table_name)
-        # TEMPORARILY DEFINE status_ready_condition MANUALLY TO AVOID DUCKDB
-        # status_ready_condition = ("astrometry_status IN (-1, 1) "
-        #                           "AND essential_status IN (-1, 1) "
-        #                           "AND source_catalog_status IN (-1, 1)")
+
         with engine.connect() as eng:
-            # time_condition = ('monitor_end_datetime IS NULL' if select_by_null
-            #                   else (f"exp_start_datetime >= {exp_range_start} "
-            #                         f"AND exp_start_datetime <= {exp_range_end}"))
-            # update_report_time_str = f"""
-            #     UPDATE {report_spec.meta_table_name}
-            #     SET monitor_end_datetime = $1
-            #     WHERE {status_ready_condition}
-            #     AND {time_condition}
-            # """
+            status_ready_condition = _status_columns_ready_condition(eng, report_spec.meta_table_name)
             time_condition = ('monitor_end_datetime IS NULL' if select_by_null
                               else (f"exp_start_datetime >= :begin "
                                     f"AND exp_start_datetime <= :end"))
@@ -187,43 +177,33 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
                 WHERE {status_ready_condition}
                 AND {time_condition}
             """
-            # pos_params = ((report_time,) + (() if select_by_null
-            #                                 else (exp_range_start, exp_range_end)))
+
             query_dict = {'now': report_time,
                           'begin': exp_range_start, 'end': exp_range_end}
-            # update_report_result = conn.execute(update_report_time_str, pos_params)
-            # update_report_result = conn.execute(update_report_time_str, (report_time,))
-            logger.info(f"Query: {text(update_report_time_str).text}")
+            logger.info(f"Query: {text(update_report_time_str).text}")  # TEMP
             update_report_result = eng.execute(text(update_report_time_str),
                                               query_dict)
-            # num_reported_rows = update_report_result.fetchall()[0][0]
             num_reported_rows = update_report_result.rowcount
             eng.commit()
             logger.info(f"Reported rows: {num_reported_rows}")
-        if select_by_null:
-            logger.info('Selecting report rows by null monitor_end_datetime')
-        else:
-            logger.info('Selecting report rows from exp_start_datetime '
-                        f"{exp_range_start} to {exp_range_end}")
-        logger.info(f"Number of reported rows: {num_reported_rows}")
     except Exception as e:
         logger.error(f"{e}")
         raise e
     finally:
-        # OJO: close direct sqlalchemy connection
         engine.connect().close()
 
+    # if there were updates, continue the process via a DuckDB connection
     if num_reported_rows > 0:
         try:
-            # report_spec = _get_report_spec(report_type, params)
-
             logger.info('Getting SQL URL')
-            sql_url = connect_to_db(database_name=params[DB_NAME], secret_name=params[DB_SECRET_NAME]).url
+            sql_url = connect_to_db(database_name=params[DB_NAME],
+                                    secret_name=params[DB_SECRET_NAME]).url
 
             # initialize duckdb local database
             logger.info('Connecting to duckdb')
             conn = duckdb.connect(database=':memory:')
-            duckdb_extension_path = os.environ.get('DUCKDB_EXTENSIONS_PATH', '/duckdb_extensions')
+            duckdb_extension_path = os.environ.get('DUCKDB_EXTENSIONS_PATH',
+                                                   '/duckdb_extensions')
             conn.execute(f"SET extension_directory = '{duckdb_extension_path}';")
 
             # Load the extensions pre-baked into your Docker image
@@ -257,30 +237,6 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
             # Switch to using rdmt_db server as default to allow SQLAlchemy to make SQL strings
             conn.sql("USE rdmt_db;")
 
-        # report_time = datetime.datetime.now().replace(microsecond=0)
-        # status_ready_condition = _status_columns_ready_condition(conn, report_spec.meta_table_name)
-        # time_condition = ('monitor_end_datetime IS NULL' if select_by_null
-        #                   else (f"exp_start_datetime >= {exp_range_start} "
-        #                         f"AND exp_start_datetime <= {exp_range_end}"))
-        # update_report_time_str = f"""
-        #     UPDATE {report_spec.meta_table_name}
-        #     SET monitor_end_datetime = $1
-        #     WHERE {status_ready_condition}
-        #     AND {time_condition}
-        # """
-        # # pos_params = ((report_time,) + (() if select_by_null
-        # #                                 else (exp_range_start, exp_range_end)))
-        # # update_report_result = conn.execute(update_report_time_str, pos_params)
-        # update_report_result = conn.execute(update_report_time_str, (report_time,))
-        # num_reported_rows = update_report_result.fetchall()[0][0]
-        # if select_by_null:
-        #     logger.info('Selecting report rows by null monitor_end_datetime')
-        # else:
-        #     logger.info('Selecting report rows from exp_start_datetime '
-        #                 f"{exp_range_start} to {exp_range_end}")
-        # logger.info(f"Number of reported rows: {num_reported_rows}")
-
-        # if num_reported_rows > 0:
             # Package metadata and results data into Parquet dataset
             s3_dataset_prefix = f"{report_spec.dataset_prefix}/"
             s3_parquet_bucket_path = f"s3://{params[PARQUET_FILE_BUCKET]}/{s3_dataset_prefix}"
@@ -298,7 +254,8 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
                 logger.info('Parquet dataset exists. Appending new rows.')
             else:
                 parquet_command = ""
-                logger.info('Parquet dataset does not exist. Creating new dataset.')
+                logger.info('Parquet dataset does not exist. '
+                            'Creating new dataset.')
 
             # TODO: We might want to sort the exported Parquet file by visit id or obs id or program to speed up queries
             parquet_export_str = f"""
@@ -342,34 +299,6 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
                 logger.error(f'{e}')
                 raise e
 
-        # else:
-        #     logger.info('No new rows to report.')
-
-        #     return {'statusCode': StatusCodes.SUCCESS,
-        #             'body': [{'message':'report_function: No new rows to report.'}]}
-
-    # except Exception as e:
-    #     logger.error(f"{e}")
-    #     raise e
-    # finally:
-    #     if conn is not None:
-    #         try:
-    #             databases = conn.sql("SHOW DATABASES").fetchall()
-    #             db_names = [row[0] for row in databases]
-
-    #             if "rdmt_db" in db_names:
-    #                 fallback_db = next((name for name in db_names if name != "rdmt_db"), None)
-    #                 if fallback_db is not None:
-    #                     conn.execute(f"USE {fallback_db};")
-    #                 else:
-    #                     # If rdmt_db is the only visible database, create one to switch into.
-    #                     conn.execute("ATTACH ':memory:' AS fallback_db;")
-    #                     conn.execute("USE fallback_db;")
-    #                 conn.execute("DETACH rdmt_db;")
-    #         except Exception as cleanup_error:
-    #             logger.warning(f"DuckDB cleanup warning: {cleanup_error}")
-    #         finally:
-    #             conn.close()
         except Exception as e:
             logger.error(f"{e}")
             raise e
@@ -380,11 +309,13 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
                     db_names = [row[0] for row in databases]
 
                     if "rdmt_db" in db_names:
-                        fallback_db = next((name for name in db_names if name != "rdmt_db"), None)
+                        fallback_db = next((name for name in db_names
+                                            if name != "rdmt_db"), None)
                         if fallback_db is not None:
                             conn.execute(f"USE {fallback_db};")
                         else:
-                            # If rdmt_db is the only visible database, create one to switch into.
+                            # If rdmt_db is the only visible database,
+                            # create one to switch into.
                             conn.execute("ATTACH ':memory:' AS fallback_db;")
                             conn.execute("USE fallback_db;")
                         conn.execute("DETACH rdmt_db;")
