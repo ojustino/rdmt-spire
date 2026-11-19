@@ -169,8 +169,8 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
         with engine.connect() as eng:
             status_ready_condition = _status_columns_ready_condition(eng, report_spec.meta_table_name)
             time_condition = ('monitor_end_datetime IS NULL' if select_by_null
-                              else (f"exp_start_datetime >= :begin "
-                                    f"AND exp_start_datetime <= :end"))
+                              else ("exp_start_datetime >= :begin "
+                                    "AND exp_start_datetime <= :end"))
             update_report_time_str = f"""
                 UPDATE {report_spec.meta_table_name}
                 SET monitor_end_datetime = :now
@@ -347,40 +347,39 @@ def _status_columns_ready_condition(conn, table_name: str) -> str:
     """
     if isinstance(conn, duckdb.DuckDBPyConnection):
         key_formatter = '$'
+        needs_wrap = False
+        quote_char = '"'
     elif isinstance(conn, sqlalchemy.engine.Connection):
         key_formatter = ':'
+        needs_wrap = True
+        # sqlalchemy query in report_function() does not find matches when
+        # status column names found here are wrapped in quotes for some reason?
+        quote_char = ''
     else:
         raise ValueError('Connection type for _status_columns_ready_condition '
                          'must be duckdb.DuckDBPyConnection or '
                          'sqlalchemy.engine.Connection.')
 
-    status_columns_query = f"""
+    wrap_query = text if needs_wrap else lambda x: x
+    status_columns_query = wrap_query(f"""
         SELECT column_name
         FROM information_schema.columns
         WHERE table_name = {key_formatter}table
           AND column_name LIKE '%_status'
         ORDER BY column_name;
-    """
+    """)
+
     query_dict = {'table': table_name}
     status_columns = [row[0] for row in conn.execute(status_columns_query,
                                                      query_dict).fetchall()]
-
-    # status_columns_query = """
-    #     SELECT column_name
-    #     FROM information_schema.columns
-    #     WHERE table_name = $1
-    #       AND column_name LIKE '%_status'
-    #     ORDER BY column_name;
-    # """
-    # status_columns = [row[0] for row in conn.execute(status_columns_query, (table_name,)).fetchall()]
-
     if not status_columns:
         raise ValueError(f"No *_status columns found in table '{table_name}'.")
 
     # Quote identifiers in case a status column name collides with SQL keywords.
     terminal_statuses = f"{int(MonitorStatus.NOT_APPLICABLE)}, {int(MonitorStatus.COMPLETE)}"
     return " AND ".join(
-        f'"{column_name}" IN ({terminal_statuses})' for column_name in status_columns
+        f'{quote_char}{column_name}{quote_char} IN ({terminal_statuses})'
+        for column_name in status_columns
     )
 
 def generate_report_message(
