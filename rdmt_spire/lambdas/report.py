@@ -130,15 +130,17 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
           or not isinstance(exp_range_end, (str, datetime.datetime))
     ):
         raise ValueError ('exp_range_start and exp_range_end arguments of '
-                          'report function must be str or datetime.datetime.')
+                          'report function must be str or datetime.datetime')
     else:
-        select_by_null = False
-        logger.info('Selecting report rows from exp_start_datetime '
-                        f"{exp_range_start} to {exp_range_end}")
         if isinstance(exp_range_start, str):
             exp_range_start = datetime.datetime.fromisoformat(exp_range_start)
         if isinstance(exp_range_end, str):
             exp_range_end = datetime.datetime.fromisoformat(exp_range_end)
+        if exp_range_start >= exp_range_end:
+            raise ValueError('exp_range_start must be before exp_range_end')
+        select_by_null = False
+        logger.info('Selecting report rows from exp_start_datetime '
+                        f"{exp_range_start} to {exp_range_end}")
 
     expected_parameters = AWS_DBS + [PARQUET_FILE_BUCKET]
     if report_type == FileTypes.L2_SCIENCE:
@@ -188,7 +190,7 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
             logger.info(f"Reported rows: {num_reported_rows}")
     except Exception as e:
         logger.error(f"{e}")
-        raise e
+        raise
     finally:
         engine.connect().close()
 
@@ -206,17 +208,12 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
                                                    '/duckdb_extensions')
             conn.execute(f"SET extension_directory = '{duckdb_extension_path}';")
 
-            # Load the extensions pre-baked into your Docker image
-            # 'mysql': To connect to MySQL; 'aws' & 'httpfs': To stream directly to S3
-            logger.info('Loading duckdb modules')
-            conn.execute("LOAD mysql;")# TODO: LOAD aws; LOAD httpfs;")
-
-            # 2. Create a secret using the 'credential_chain' provider
+            # Create a secret using the 'credential_chain' provider.
             # This tells DuckDB to automatically find credentials using AWS SDK mechanisms
             logger.info('Creating duckdb secrets')
             conn.execute("CREATE SECRET (TYPE s3, PROVIDER credential_chain);")
 
-            # --- 3. LINKING THE DATABASE ---
+            # --- LINKING THE DATABASE ---
             # Construct a DuckDB-specific connection string from the SQLAlchemy object
             create_secret_sql = f"""
                 CREATE OR REPLACE TEMPORARY SECRET db_secret (
@@ -234,7 +231,8 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
             logger.info('Attaching external database to duckdb')
             conn.sql("ATTACH '' AS rdmt_db (TYPE mysql, SECRET 'db_secret');")
 
-            # Switch to using rdmt_db server as default to allow SQLAlchemy to make SQL strings
+            # Switch to using rdmt_db server as default to allow SQLAlchemy
+            # to make SQL strings
             conn.sql("USE rdmt_db;")
 
             # Package metadata and results data into Parquet dataset
@@ -257,7 +255,8 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
                 logger.info('Parquet dataset does not exist. '
                             'Creating new dataset.')
 
-            # TODO: We might want to sort the exported Parquet file by visit id or obs id or program to speed up queries
+            # TODO: We might want to sort the exported Parquet file by visit id
+            # or obs id or program to speed up queries
             parquet_export_str = f"""
                 COPY (
                     SELECT
@@ -297,16 +296,16 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
                 logger.info('Successfully posted report to topic.')
             except Exception as e:
                 logger.error(f'{e}')
-                raise e
+                raise
 
         except Exception as e:
             logger.error(f"{e}")
-            raise e
+            raise
         finally:
             if conn is not None:
                 try:
                     databases = conn.sql("SHOW DATABASES").fetchall()
-                    db_names = [row[0] for row in databases]
+                    db_names = [row[0].lower() for row in databases]
 
                     if "rdmt_db" in db_names:
                         fallback_db = next((name for name in db_names
