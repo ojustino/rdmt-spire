@@ -348,13 +348,9 @@ def _status_columns_ready_condition(conn, table_name: str) -> str:
     if isinstance(conn, duckdb.DuckDBPyConnection):
         key_formatter = '$'
         needs_wrap = False
-        quote_char = '"'
     elif isinstance(conn, sqlalchemy.engine.Connection):
         key_formatter = ':'
         needs_wrap = True
-        # sqlalchemy query in report_function() does not find matches when
-        # status column names found here are wrapped in quotes for some reason?
-        quote_char = ''
     else:
         raise ValueError('Connection type for _status_columns_ready_condition '
                          'must be duckdb.DuckDBPyConnection or '
@@ -378,7 +374,7 @@ def _status_columns_ready_condition(conn, table_name: str) -> str:
     # Quote identifiers in case a status column name collides with SQL keywords.
     terminal_statuses = f"{int(MonitorStatus.NOT_APPLICABLE)}, {int(MonitorStatus.COMPLETE)}"
     return " AND ".join(
-        f'{quote_char}{column_name}{quote_char} IN ({terminal_statuses})'
+        f"{column_name} IN ({terminal_statuses})"
         for column_name in status_columns
     )
 
