@@ -307,6 +307,9 @@ def report_function(report_type: str = FileTypes.L2_SCIENCE,
                     databases = conn.sql("SHOW DATABASES").fetchall()
                     db_names = [row[0].lower() for row in databases]
 
+                    # Switch to a different DuckDB in-memory database
+                    # (fallback_db) in order to safely disconnect from rdmt_db,
+                    # creating one if it does not already exist
                     if "rdmt_db" in db_names:
                         fallback_db = next((name for name in db_names
                                             if name != "rdmt_db"), None)
